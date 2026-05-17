@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-Libgen downloader for GitHub Actions.
+Libgen downloader — built for GitHub Actions.
 
-Accepted inputs (BOOK_URL env var):
-  - Bare MD5:                  ee012119554cf6f9a2a4fd5662de8d17
-  - libgen ads page:           https://libgen.li/ads.php?md5=<md5>
-                               https://libgen.is/ads.php?md5=<md5>
-  - library.lol page:         https://library.lol/main/<md5>
-  - libgen edition page:       https://libgen.li/edition.php?id=<id>
-  - Direct CDN (key optional): https://cdn4.booksdl.lc/get.php?md5=<md5>&key=...
+Best inputs (BOOK_URL):
+  ee012119554cf6f9a2a4fd5662de8d17          ← bare MD5, most reliable
+  https://libgen.li/ads.php?md5=<md5>       ← ads page
+  https://library.lol/main/<md5>            ← library.lol page
 
-The safest input is a bare MD5 or ads.php?md5= URL.
-Direct get.php?key= URLs have keys that expire within minutes.
+How Libgen download actually works (two hops):
+  1. ads.php?md5=X  →  find link to library.lol/main/X
+  2. library.lol/main/X  →  find the GET button  →  actual file on cdn/get.php
 """
 
 import concurrent.futures
@@ -32,43 +30,32 @@ from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 from urllib3.util.retry import Retry
 
-# ─────────────────────────────────────────── config ───────────────────────────
+# ──────────────────────────────────────────────────────────────── config ──────
 
 CACHE_DIR  = Path(".download_cache")
 CACHE_FILE = CACHE_DIR / "downloads.json"
 
-MAX_RETRIES      = 20
-CHUNK_SIZE       = 256 * 1024  # 256 KB
-TIMEOUT          = (15, 90)    # connect, read
-STALL_TIMEOUT    = 120         # seconds of silence = stalled
-BASE_BACKOFF     = 3
-MAX_BACKOFF      = 90
-MAX_FILE_MB      = 1900        # warn above this
+MAX_RETRIES   = 8          # enough, not excessive
+CHUNK_SIZE    = 512 * 1024 # 512 KB
+TIMEOUT       = (10, 60)   # connect, read
+STALL_TIMEOUT = 90         # seconds with no bytes
+BASE_BACKOFF  = 5
+MAX_BACKOFF   = 60
+MAX_FILE_MB   = 1900
 
 LIBGEN_MIRRORS = [
     "https://libgen.is",
     "https://libgen.rs",
     "https://libgen.st",
     "https://libgen.li",
-    "https://libgen.vip",
-]
-
-# Hosts that serve raw file bytes given /main/<md5>
-DOWNLOAD_HOSTS = [
-    "https://library.lol",
-    "https://libgen.li",
-    "https://cdn1.booksdl.org",
-    "https://cdn2.booksdl.org",
-    "https://cdn3.booksdl.org",
-    "https://cdn4.booksdl.lc",
 ]
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/17.5 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
 ]
 
 BOOK_EXTS = (
@@ -76,28 +63,9 @@ BOOK_EXTS = (
     ".djvu", ".fb2", ".cbz", ".cbr", ".lit", ".lrf",
 )
 
-# (magic_bytes, label)
-MAGIC = [
-    (b"PK\x03\x04", "epub/zip"),
-    (b"%PDF",        "pdf"),
-    (b"AT&TFORM",    "djvu"),
-    (b"BOOKMOBI",    "mobi"),
-]
-
 CACHE_DIR.mkdir(exist_ok=True)
 
-
-# ─────────────────────────────────────────── session ──────────────────────────
-
-def _retry() -> Retry:
-    return Retry(
-        total=6, connect=6, read=4,
-        backoff_factor=2,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET", "HEAD"]),
-        raise_on_status=False,
-    )
-
+# ──────────────────────────────────────────────────────────────── session ─────
 
 def make_session() -> requests.Session:
     s = requests.Session()
@@ -105,62 +73,59 @@ def make_session() -> requests.Session:
         "User-Agent":      random.choice(USER_AGENTS),
         "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": "gzip, deflate",
         "Connection":      "keep-alive",
     })
-    a = HTTPAdapter(max_retries=_retry(), pool_connections=4, pool_maxsize=8)
+    retry = Retry(
+        total=3, connect=3, read=2,
+        backoff_factor=1,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"]),
+        raise_on_status=False,
+    )
+    a = HTTPAdapter(max_retries=retry, pool_connections=2, pool_maxsize=4)
     s.mount("https://", a)
     s.mount("http://",  a)
     return s
 
 
-# Shared session for page fetching only.
-# Each download attempt gets its own session to avoid stale pool issues.
 SESSION = make_session()
 
-
-# ─────────────────────────────────────────── cache ────────────────────────────
+# ──────────────────────────────────────────────────────────────── cache ───────
 
 def load_cache() -> dict:
     try:
         return json.loads(CACHE_FILE.read_text()) if CACHE_FILE.exists() else {}
-    except (json.JSONDecodeError, OSError):
+    except Exception:
         return {}
-
 
 def save_cache(data: dict) -> None:
     try:
         CACHE_FILE.write_text(json.dumps(data, indent=2))
-    except OSError as e:
-        print(f"  ⚠ cache write failed: {e}")
+    except Exception as e:
+        print(f"  ⚠ cache write: {e}")
 
+# ──────────────────────────────────────────────────────────────── helpers ─────
 
-# ─────────────────────────────────────────── helpers ──────────────────────────
+def fmt(n: float) -> str:
+    for u in ("B","KB","MB","GB"):
+        if n < 1024: return f"{n:.2f} {u}"
+        n /= 1024
+    return f"{n:.2f} TB"
 
-def fmt(size: float) -> str:
-    for u in ("B", "KB", "MB", "GB"):
-        if size < 1024:
-            return f"{size:.2f} {u}"
-        size /= 1024
-    return f"{size:.2f} TB"
-
-
-def md5_file(path: Path) -> str:
+def file_md5(p: Path) -> str:
     h = hashlib.md5()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
-            h.update(chunk)
+    with open(p, "rb") as f:
+        for c in iter(lambda: f.read(4*1024*1024), b""):
+            h.update(c)
     return h.hexdigest().lower()
-
 
 def is_md5(s: str) -> bool:
     return bool(re.fullmatch(r"[a-fA-F0-9]{32}", s.strip()))
 
-
 def md5_from_url(url: str) -> Optional[str]:
-    """Extract MD5 from query string, path, or anywhere in the URL."""
     qs = parse_qs(urlparse(url).query)
-    for k in ("md5", "MD5"):
+    for k in ("md5","MD5"):
         if k in qs and is_md5(qs[k][0]):
             return qs[k][0].lower()
     for part in urlparse(url).path.split("/"):
@@ -169,235 +134,311 @@ def md5_from_url(url: str) -> Optional[str]:
     m = re.search(r"[=/_-]([a-fA-F0-9]{32})(?:[&/?]|$)", url)
     return m.group(1).lower() if m else None
 
-
 def sanitize(name: str) -> str:
     name = unquote(name)
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
     name = re.sub(r"\s+", " ", name).strip(" ._")
-    if len(name) > 200:
+    if len(name) > 180:
         stem, ext = os.path.splitext(name)
-        name = stem[:200 - len(ext)] + ext
+        name = stem[:180-len(ext)] + ext
     return name or f"book_{int(time.time())}"
 
-
-def fname_from_headers(r: requests.Response) -> Optional[str]:
-    cd = r.headers.get("content-disposition", "")
+def fname_headers(r: requests.Response) -> Optional[str]:
+    cd = r.headers.get("content-disposition","")
     m = re.search(r"filename\*\s*=\s*(?:UTF-8'')?([^;]+)", cd, re.I)
-    if m:
-        return sanitize(m.group(1).strip().strip('"\''))
+    if m: return sanitize(m.group(1).strip().strip('"\''))
     m = re.search(r'filename\s*=\s*"?([^";]+)"?', cd, re.I)
-    if m:
-        return sanitize(m.group(1).strip())
+    if m: return sanitize(m.group(1).strip())
     return None
 
-
-def fname_from_url(url: str) -> str:
+def fname_url(url: str) -> str:
     name = os.path.basename(unquote(urlparse(url).path))
     if name and "." in name and not name.startswith("."):
         return sanitize(name)
     return f"book_{int(time.time())}.epub"
 
+def is_html_bytes(b: bytes) -> bool:
+    s = b[:256].lower()
+    return any(m in s for m in (b"<!doctype",b"<html",b"<head>"))
 
-def is_binary_response(content_type: str, head: bytes) -> bool:
-    ct = content_type.lower()
-    binary_ct = (
-        "application/epub", "application/pdf", "application/octet-stream",
-        "application/zip", "application/x-mobipocket", "application/x-mobi8",
-        "application/vnd.amazon", "application/x-fictionbook", "image/vnd.djvu",
-    )
-    if any(b in ct for b in binary_ct):
-        return True
-    return any(head[:len(m)] == m or m in head[:64] for m, _ in MAGIC)
+def is_binary_ct(ct: str) -> bool:
+    ct = ct.lower()
+    return any(x in ct for x in (
+        "epub","pdf","octet-stream","zip","mobipocket",
+        "mobi8","amazon","fictionbook","djvu",
+    ))
 
+def dbg(msg: str) -> None:
+    """Print with timestamp for debugging slow runs."""
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
-def is_html(data: bytes) -> bool:
-    s = data[:256].lower()
-    return any(m in s for m in (b"<!doctype html", b"<html", b"<head>", b"<title>"))
+# ──────────────────────────────────────────────────────── page fetching ───────
 
+def get_page(url: str, label: str = "") -> tuple[str, BeautifulSoup]:
+    """
+    Fetch a page and return (final_url, soup).
+    Raises on non-200 or if response looks like a blank/error page.
+    """
+    dbg(f"GET {label or url[:80]}")
+    r = SESSION.get(url, timeout=TIMEOUT, allow_redirects=True)
+    dbg(f"  → HTTP {r.status_code}  {len(r.text)} chars  url={r.url[:80]}")
+    r.raise_for_status()
+    if len(r.text) < 200:
+        raise RuntimeError(f"Response too short ({len(r.text)} chars) from {url}")
+    return r.url, BeautifulSoup(r.text, "lxml")
 
-# ─────────────────────────────────────────── mirror probe ─────────────────────
+# ──────────────────────────────────────────────────── link extraction ─────────
 
-def _probe(mirror: str, md5: str) -> Optional[str]:
-    url = f"{mirror}/ads.php?md5={md5}"
-    try:
-        r = SESSION.get(url, timeout=(8, 15))
-        if r.status_code == 200 and len(r.text) > 400:
-            return url
-    except requests.RequestException:
-        pass
-    return None
-
-
-def best_ads_url(md5: str) -> str:
-    """Return the fastest responding ads.php URL, falling back to library.lol."""
-    print("  🔍 Probing mirrors...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(LIBGEN_MIRRORS)) as ex:
-        futs = {ex.submit(_probe, m, md5): m for m in LIBGEN_MIRRORS}
-        for fut in concurrent.futures.as_completed(futs):
-            url = fut.result()
-            if url:
-                print(f"  ✓ Using: {futs[fut]}")
-                for f in futs:
-                    f.cancel()
-                return url
-    fallback = f"https://library.lol/main/{md5}"
-    print(f"  ⚠ All mirrors failed, using {fallback}")
-    return fallback
-
-
-# ─────────────────────────────────────────── link extraction ──────────────────
-
-def _md5_from_page(soup: BeautifulSoup, html: str) -> Optional[str]:
-    for tag in soup.find_all(["td", "th", "a", "span", "div"]):
+def extract_md5_from_page(soup: BeautifulSoup, html: str) -> Optional[str]:
+    # Look for 32-char hex in table cells / links
+    for tag in soup.find_all(["td","th","a","span","div","p"]):
         t = tag.get_text(strip=True)
         if is_md5(t):
             return t.lower()
+    # labeled in attributes or text
     m = re.search(r'(?:md5|MD5)\s*[=:]\s*["\']?([a-fA-F0-9]{32})', html)
     return m.group(1).lower() if m else None
 
 
-def _link_from_soup(soup: BeautifulSoup, base: str, html: str) -> Optional[str]:
-    # 1. Explicit GET/DOWNLOAD button
+def extract_download_link(soup: BeautifulSoup, base_url: str, html: str) -> Optional[str]:
+    """
+    Multi-strategy extraction — returns the best direct download link or None.
+    Prints every candidate it considers so we can debug.
+    """
+    dbg(f"  Scanning page for download link  (base={base_url[:60]})")
+
+    # Strategy 1: explicit GET / DOWNLOAD text on <a>
     for a in soup.find_all("a", href=True):
-        t = a.get_text(strip=True).upper()
-        h = a["href"]
-        if t in {"GET", "DOWNLOAD", "TÉLÉCHARGER", "DESCARGAR", "СКАЧАТЬ"}:
-            return urljoin(base, h)
-        if "get.php" in h.lower():
-            return urljoin(base, h)
-    # 2. href ends with book extension
+        text = a.get_text(strip=True).upper()
+        href = a["href"]
+        if text in {"GET","DOWNLOAD","TÉLÉCHARGER","DESCARGAR","СКАЧАТЬ"}:
+            link = urljoin(base_url, href)
+            dbg(f"  ✓ [S1-text] {link[:80]}")
+            return link
+        if "get.php" in href.lower():
+            link = urljoin(base_url, href)
+            dbg(f"  ✓ [S1-getphp] {link[:80]}")
+            return link
+
+    # Strategy 2: href ends with book extension
     for a in soup.find_all("a", href=True):
-        if any(a["href"].lower().split("?")[0].endswith(e) for e in BOOK_EXTS):
-            return urljoin(base, a["href"])
-    # 3. CDN keywords in href
-    cdn = ("cloudflare-ipfs", "ipfs.io", "booksdl", "library.lol", "/main/")
+        clean = a["href"].split("?")[0].lower()
+        if any(clean.endswith(e) for e in BOOK_EXTS):
+            link = urljoin(base_url, a["href"])
+            dbg(f"  ✓ [S2-ext] {link[:80]}")
+            return link
+
+    # Strategy 3: CDN / booksdl / library.lol anywhere in href
+    cdn_kw = ("booksdl","cdn1","cdn2","cdn3","cdn4","library.lol",
+               "cloudflare-ipfs","ipfs.io")
     for a in soup.find_all("a", href=True):
-        if any(k in a["href"].lower() for k in cdn):
-            return urljoin(base, a["href"])
-    # 4. Regex over raw HTML
-    for m in re.findall(r'https?://[^\s"\'<>]+', html):
-        ml = m.lower().split("?")[0]
-        if any(ml.endswith(e) for e in BOOK_EXTS) or "/get.php" in m.lower():
+        if any(k in a["href"].lower() for k in cdn_kw):
+            link = urljoin(base_url, a["href"])
+            dbg(f"  ✓ [S3-cdn] {link[:80]}")
+            return link
+
+    # Strategy 4: regex over raw HTML for any URL ending in book ext
+    for m in re.findall(r'https?://[^\s"\'<>]{10,}', html):
+        if any(m.lower().split("?")[0].endswith(e) for e in BOOK_EXTS):
+            dbg(f"  ✓ [S4-regex-ext] {m[:80]}")
             return m
+        if "/get.php" in m.lower() or "booksdl" in m.lower():
+            dbg(f"  ✓ [S4-regex-cdn] {m[:80]}")
+            return m
+
+    # Log all <a> hrefs we saw so we can debug
+    all_hrefs = [a["href"] for a in soup.find_all("a", href=True)]
+    dbg(f"  ✗ No link found. All hrefs ({len(all_hrefs)}):")
+    for h in all_hrefs[:30]:
+        dbg(f"       {h}")
     return None
 
+# ──────────────────────────────────────────────────── mirror probing ──────────
 
-def _fetch_page(url: str) -> tuple[requests.Response, BeautifulSoup]:
-    r = SESSION.get(url, timeout=TIMEOUT, allow_redirects=True)
-    r.raise_for_status()
-    return r, BeautifulSoup(r.text, "lxml")
+def _probe_mirror(mirror: str, md5: str) -> Optional[str]:
+    url = f"{mirror}/ads.php?md5={md5}"
+    try:
+        r = SESSION.get(url, timeout=(6, 12), allow_redirects=True)
+        if r.status_code == 200 and len(r.text) > 300:
+            dbg(f"  mirror ok: {mirror}  ({len(r.text)} chars)")
+            return url
+        dbg(f"  mirror bad: {mirror}  status={r.status_code}  len={len(r.text)}")
+    except Exception as e:
+        dbg(f"  mirror fail: {mirror}  {e}")
+    return None
 
+def best_mirror_ads_url(md5: str) -> str:
+    dbg("Probing mirrors in parallel...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(LIBGEN_MIRRORS)) as ex:
+        futs = {ex.submit(_probe_mirror, m, md5): m for m in LIBGEN_MIRRORS}
+        for fut in concurrent.futures.as_completed(futs):
+            result = fut.result()
+            if result:
+                for f in futs: f.cancel()
+                return result
+    # All failed — go straight to library.lol
+    fallback = f"https://library.lol/main/{md5}"
+    dbg(f"All mirrors failed → {fallback}")
+    return fallback
 
-# ─────────────────────────────────────────── URL resolution ───────────────────
+# ──────────────────────────────────────────────────── resolution ──────────────
 
-def resolve(url: str) -> tuple[str, Optional[str]]:
+def resolve_to_download_url(raw: str) -> tuple[str, Optional[str]]:
     """
-    Given any supported input, return (direct_download_url, md5_or_None).
+    Turn any supported input into (direct_download_url, md5).
 
-    Resolution order:
-      bare MD5          → mirror probe → ads page → GET link
-      ads.php?md5=      → extract md5 → same
-      library.lol/main/ → parse GET button
-      edition.php?id=   → parse page → fallback to md5
-      direct get.php    → validate; if expired key, re-resolve via md5
-      unknown           → try HEAD for binary, else parse as HTML
+    The full chain for a bare MD5:
+      MD5
+        → best ads.php?md5=MD5   (mirror probe)
+        → find library.lol/main/MD5 link on that page
+        → fetch library.lol/main/MD5
+        → find GET button → actual cdn get.php URL  ← real file
     """
-    url = url.strip()
+    raw = raw.strip()
 
     # ── bare MD5 ──────────────────────────────────────────────────────────────
-    if is_md5(url):
-        return _resolve_md5(url.lower())
+    if is_md5(raw):
+        dbg(f"Input is bare MD5: {raw}")
+        return _resolve_from_md5(raw.lower())
 
-    parsed = urlparse(url)
+    parsed = urlparse(raw)
     host   = parsed.netloc.lower()
     path   = parsed.path.lower()
-    qs     = parsed.query.lower()
 
     # ── ads.php?md5= ──────────────────────────────────────────────────────────
-    if "ads.php" in path and "md5" in qs:
-        md5 = md5_from_url(url)
+    if "ads.php" in path:
+        md5 = md5_from_url(raw)
         if md5:
-            return _resolve_md5(md5)
+            dbg(f"Input is ads.php, extracted MD5: {md5}")
+            return _resolve_from_md5(md5)
+        # no md5 in URL — just parse the page
+        final_url, soup = get_page(raw, "ads page")
+        return _resolve_from_ads_page(final_url, soup, raw.text, None)
 
     # ── library.lol/main/<md5> ────────────────────────────────────────────────
     if "library.lol" in host and "/main/" in path:
-        md5 = md5_from_url(url)
-        r, soup = _fetch_page(url)
-        link = _link_from_soup(soup, r.url, r.text)
-        if link:
-            return link, md5
-        raise RuntimeError(f"No download link on library.lol page: {url}")
+        md5 = md5_from_url(raw)
+        dbg(f"Input is library.lol page, MD5={md5}")
+        return _resolve_from_lol_page(raw, md5)
 
-    # ── edition.php?id= ───────────────────────────────────────────────────────
+    # ── edition.php ───────────────────────────────────────────────────────────
     if "edition.php" in path:
-        r, soup = _fetch_page(url)
-        md5 = _md5_from_page(soup, r.text)
-        link = _link_from_soup(soup, r.url, r.text)
+        dbg("Input is edition.php page")
+        final_url, soup = get_page(raw, "edition page")
+        html = str(soup)
+        md5  = extract_md5_from_page(soup, html)
+        link = extract_download_link(soup, final_url, html)
         if link:
             return link, md5
         if md5:
-            return _resolve_md5(md5)
-        raise RuntimeError(f"Nothing usable on edition page: {url}")
+            return _resolve_from_md5(md5)
+        raise RuntimeError(f"Nothing usable on edition page: {raw}")
 
     # ── direct get.php or file URL ────────────────────────────────────────────
     if "get.php" in path or any(path.endswith(e) for e in BOOK_EXTS):
-        md5 = md5_from_url(url)
-        # Validate it's still alive
+        md5 = md5_from_url(raw)
+        dbg(f"Input looks like direct URL, MD5={md5}")
+        # Validate it — keys expire fast
         try:
-            with SESSION.get(url, stream=True, timeout=TIMEOUT) as r:
-                if r.status_code == 200:
-                    head = next(r.iter_content(256), b"")
-                    ct   = r.headers.get("content-type", "")
-                    if is_binary_response(ct, head) and not is_html(head):
-                        print("  ✓ Direct URL is live")
-                        return r.url, md5 or md5_from_url(r.url)
-        except requests.RequestException as e:
-            print(f"  ⚠ Direct probe failed: {e}")
-        # Key expired or bad — re-resolve via md5
+            with SESSION.get(raw, stream=True, timeout=(8,20)) as r:
+                head = next(r.iter_content(512), b"")
+                ct   = r.headers.get("content-type","")
+                dbg(f"  Direct probe: HTTP {r.status_code}  CT={ct}  "
+                    f"html={is_html_bytes(head)}")
+                if r.status_code == 200 and is_binary_ct(ct) and not is_html_bytes(head):
+                    dbg("  ✓ Direct URL is live")
+                    return r.url, md5 or md5_from_url(r.url)
+        except Exception as e:
+            dbg(f"  Direct probe error: {e}")
+        # Key expired → re-resolve
         if md5:
-            print(f"  ↩ Key likely expired; re-resolving via MD5 {md5}")
-            return _resolve_md5(md5)
-        raise RuntimeError(f"Direct URL failed and no MD5 in URL: {url}")
+            dbg(f"  Falling back to MD5 resolution: {md5}")
+            return _resolve_from_md5(md5)
+        raise RuntimeError(f"Direct URL failed and no MD5 found: {raw}")
 
     # ── generic fallback ──────────────────────────────────────────────────────
-    print(f"  ⚠ Unknown URL pattern, attempting generic resolution")
-    md5 = md5_from_url(url)
+    dbg(f"Unknown URL pattern, attempting generic parse: {raw[:80]}")
+    md5 = md5_from_url(raw)
     if md5:
-        return _resolve_md5(md5)
-    # Try fetching as HTML
-    r, soup = _fetch_page(url)
-    page_md5 = _md5_from_page(soup, r.text)
-    link = _link_from_soup(soup, r.url, r.text)
+        return _resolve_from_md5(md5)
+    final_url, soup = get_page(raw, "unknown page")
+    html = str(soup)
+    page_md5 = extract_md5_from_page(soup, html)
+    link     = extract_download_link(soup, final_url, html)
     if link:
         return link, page_md5
     if page_md5:
-        return _resolve_md5(page_md5)
-    raise RuntimeError(f"Cannot resolve: {url}")
+        return _resolve_from_md5(page_md5)
+    raise RuntimeError(f"Cannot resolve: {raw}")
 
 
-def _resolve_md5(md5: str) -> tuple[str, str]:
-    """Given a confirmed MD5, get the best ads page and extract a download link."""
-    ads_url = best_ads_url(md5)
+def _resolve_from_md5(md5: str) -> tuple[str, str]:
+    """Full two-hop resolution: MD5 → ads page → lol page → get.php file."""
 
-    # library.lol/main/<md5> returns the file directly after one redirect
+    # Hop 1: find best ads.php page
+    ads_url = best_mirror_ads_url(md5)
+
+    # If we landed on library.lol directly, skip to hop 2
     if "library.lol/main/" in ads_url:
-        return ads_url, md5
+        return _resolve_from_lol_page(ads_url, md5)
 
-    r, soup = _fetch_page(ads_url)
-    link = _link_from_soup(soup, r.url, r.text)
+    # Parse the ads page to find a library.lol link
+    try:
+        final_url, soup = get_page(ads_url, "ads page")
+        html = str(soup)
+    except Exception as e:
+        dbg(f"ads page failed: {e} — going straight to library.lol")
+        return _resolve_from_lol_page(f"https://library.lol/main/{md5}", md5)
+
+    # Look for library.lol/main link specifically on the ads page
+    lol_link = None
+    for a in soup.find_all("a", href=True):
+        if "library.lol/main" in a["href"] or "library.lol" in a["href"]:
+            lol_link = urljoin(final_url, a["href"])
+            dbg(f"  Found library.lol link on ads page: {lol_link[:80]}")
+            break
+
+    if lol_link:
+        return _resolve_from_lol_page(lol_link, md5)
+
+    # Ads page might have a direct download link already
+    link = extract_download_link(soup, final_url, html)
     if link:
         return link, md5
 
-    # Hard fallback: library.lol
-    fallback = f"https://library.lol/main/{md5}"
-    print(f"  ↩ No link on ads page; using {fallback}")
-    return fallback, md5
+    # Last resort: go straight to library.lol
+    dbg("No link on ads page, trying library.lol directly")
+    return _resolve_from_lol_page(f"https://library.lol/main/{md5}", md5)
 
 
-# ─────────────────────────────────────────── stall detection ──────────────────
+def _resolve_from_lol_page(url: str, md5: Optional[str]) -> tuple[str, Optional[str]]:
+    """
+    Fetch a library.lol/main/<md5> page and extract the GET button link.
+    This is always the final hop before the actual file.
+    """
+    dbg(f"Fetching library.lol page: {url[:80]}")
+    try:
+        final_url, soup = get_page(url, "library.lol")
+    except Exception as e:
+        raise RuntimeError(f"library.lol unreachable: {e}") from e
+
+    html = str(soup)
+    link = extract_download_link(soup, final_url, html)
+    if link:
+        dbg(f"  ✓ Got final download link: {link[:80]}")
+        return link, md5
+
+    raise RuntimeError(
+        f"No download link found on library.lol page. "
+        f"Page length: {len(html)} chars. "
+        f"URL: {url}"
+    )
+
+# ──────────────────────────────────────────────────── stall detection ─────────
 
 class Stall:
-    def __init__(self, timeout: int, grace: int = 30):
+    def __init__(self, timeout: int, grace: int = 20):
         self._t   = timeout
         self._g   = grace
         self._s   = time.monotonic()
@@ -413,119 +454,139 @@ class Stall:
         elapsed = time.monotonic() - self._s
         limit   = self._t if elapsed > self._g else self._t * 2
         if idle > limit:
-            raise TimeoutError(
-                f"No data for {idle:.0f}s (got {fmt(self._tot)} total)"
-            )
+            raise TimeoutError(f"Stalled: {idle:.0f}s silence, {fmt(self._tot)} received")
 
+# ──────────────────────────────────────────────────── download ────────────────
 
-# ─────────────────────────────────────────── download ─────────────────────────
-
-def _range_ok(url: str) -> bool:
+def _range_supported(url: str) -> bool:
     try:
-        r = SESSION.head(url, timeout=(8, 10), allow_redirects=True)
-        return r.headers.get("accept-ranges", "").lower() == "bytes"
-    except requests.RequestException:
+        r = SESSION.head(url, timeout=(5,8), allow_redirects=True)
+        ok = r.headers.get("accept-ranges","").lower() == "bytes"
+        dbg(f"  Range support: {ok}  (status={r.status_code})")
+        return ok
+    except Exception as e:
+        dbg(f"  Range HEAD failed: {e}")
         return False
 
 
-def download_file(url: str, out: Path, expected_md5: Optional[str] = None) -> Path:
-    out.mkdir(parents=True, exist_ok=True)
+def download_file(url: str, out_dir: Path, expected_md5: Optional[str]) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    uid       = hashlib.sha1(url.encode()).hexdigest()[:16]
-    tmp       = out / f".{uid}.part"
-    meta      = out / f".{uid}.meta"
+    uid  = hashlib.sha1(url.encode()).hexdigest()[:16]
+    tmp  = out_dir / f".{uid}.part"
+    meta = out_dir / f".{uid}.meta"
+
     existing  = tmp.stat().st_size if tmp.exists() else 0
-    resumable = existing > 0 and _range_ok(url)
+    resumable = existing > 0 and _range_supported(url)
 
     if existing > 0 and not resumable:
-        print(f"  ⚠ No range support — restarting (discarding {fmt(existing)})")
+        dbg(f"  No range support — discarding {fmt(existing)}")
         tmp.unlink(missing_ok=True)
         existing = 0
 
-    hdrs: dict[str, str] = {}
+    hdrs: dict[str,str] = {}
     if resumable:
         hdrs["Range"] = f"bytes={existing}-"
-        print(f"  ↻ Resuming from {fmt(existing)}")
+        dbg(f"  Resuming from {fmt(existing)}")
 
     sess = make_session()
+    dbg(f"  Opening stream: {url[:80]}")
     resp = sess.get(url, stream=True, timeout=TIMEOUT,
                     headers=hdrs, allow_redirects=True)
+    dbg(f"  Stream opened: HTTP {resp.status_code}  "
+        f"CT={resp.headers.get('content-type','?')}  "
+        f"CL={resp.headers.get('content-length','?')}")
 
     if resp.status_code == 416:
-        print("  ⚠ 416 — restarting")
+        dbg("  416 — restarting")
         resp.close()
         tmp.unlink(missing_ok=True)
         meta.unlink(missing_ok=True)
-        return download_file(url, out, expected_md5)
+        return download_file(url, out_dir, expected_md5)
 
     if resp.status_code not in (200, 206):
         resp.close()
-        raise RuntimeError(f"HTTP {resp.status_code}")
+        raise RuntimeError(f"HTTP {resp.status_code} from {url[:80]}")
 
+    # Validate resume offset
     if resp.status_code == 206:
-        cr = resp.headers.get("content-range", "")
+        cr = resp.headers.get("content-range","")
         m  = re.search(r"bytes (\d+)-", cr)
         if m and int(m.group(1)) != existing:
-            print("  ⚠ Wrong resume offset — restarting")
+            dbg(f"  Wrong resume offset in Content-Range: {cr}")
             resp.close()
             tmp.unlink(missing_ok=True)
-            return download_file(url, out, expected_md5)
+            return download_file(url, out_dir, expected_md5)
 
-    cl         = int(resp.headers.get("content-length", 0))
-    total      = (cl + existing) if resp.status_code == 206 else cl
-    final_name = (
-        fname_from_headers(resp)
+    cl    = int(resp.headers.get("content-length", 0))
+    total = (cl + existing) if resp.status_code == 206 else cl
+
+    # Resolve filename
+    fname = (
+        fname_headers(resp)
         or (meta.read_text().strip() if meta.exists() else None)
-        or fname_from_url(resp.url)
+        or fname_url(resp.url)
     )
-    meta.write_text(final_name)
-    dest = out / final_name
+    meta.write_text(fname)
+    dest = out_dir / fname
 
-    print(f"  📥 {final_name}")
-    print(f"  📦 {fmt(total) if total else 'unknown size'}")
+    dbg(f"  Filename: {fname}")
+    dbg(f"  Total size: {fmt(total) if total else 'unknown'}")
+
     if total and total > MAX_FILE_MB * 1024 * 1024:
-        print(f"  ⚠ File > {MAX_FILE_MB} MB — consider Git LFS")
+        dbg(f"  ⚠ File > {MAX_FILE_MB} MB")
 
-    stall = Stall(STALL_TIMEOUT)
-    seen_first = False
+    stall      = Stall(STALL_TIMEOUT)
+    first_seen = False
+    last_log   = time.monotonic()
 
     with open(tmp, "ab" if existing else "wb") as fh, tqdm(
         total=total or None, initial=existing,
         unit="B", unit_scale=True, unit_divisor=1024,
-        ascii=True, dynamic_ncols=True, miniters=1, desc="  ↓",
+        ascii=True, dynamic_ncols=True, desc="  ↓",
     ) as bar:
         try:
             for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                 if not chunk:
                     continue
-                if not seen_first:
-                    seen_first = True
-                    if is_html(chunk[:256]):
+                if not first_seen:
+                    first_seen = True
+                    dbg(f"  First bytes: {chunk[:16].hex()}  html={is_html_bytes(chunk)}")
+                    if is_html_bytes(chunk):
                         resp.close()
                         raise RuntimeError(
-                            "Server sent HTML (CAPTCHA / error page) instead of file"
+                            "Server sent an HTML page instead of the file. "
+                            "Likely a CAPTCHA or expired session."
                         )
                 fh.write(chunk)
                 bar.update(len(chunk))
                 stall.tick(len(chunk))
                 stall.check()
+                # Log progress every 30s for long downloads
+                if time.monotonic() - last_log > 30:
+                    written = tmp.stat().st_size
+                    dbg(f"  Progress: {fmt(written)}" +
+                        (f" / {fmt(total)}" if total else ""))
+                    last_log = time.monotonic()
         finally:
             resp.close()
 
     actual = tmp.stat().st_size
+    dbg(f"  Download complete: {fmt(actual)}")
+
     if total and actual < total:
         raise IOError(f"Incomplete: {fmt(actual)} of {fmt(total)}")
 
     if expected_md5:
-        print("  🔍 Verifying MD5...")
-        got = md5_file(tmp)
+        dbg("  Verifying MD5...")
+        got = file_md5(tmp)
         if got != expected_md5.lower():
             tmp.unlink(missing_ok=True)
             meta.unlink(missing_ok=True)
-            raise IOError(f"MD5 mismatch: expected {expected_md5}, got {got}")
-        print(f"  ✓ MD5 OK")
+            raise IOError(f"MD5 mismatch: expected={expected_md5} got={got}")
+        dbg(f"  ✓ MD5 OK: {got}")
     else:
-        print("  ℹ Skipping MD5 check (none provided)")
+        dbg("  Skipping MD5 check (none provided)")
 
     if dest.exists():
         dest.unlink()
@@ -533,31 +594,82 @@ def download_file(url: str, out: Path, expected_md5: Optional[str] = None) -> Pa
     meta.unlink(missing_ok=True)
     return dest
 
+# ──────────────────────────────────────────────────── retry loop ──────────────
 
-# ─────────────────────────────────────────── retry loop ───────────────────────
-
-def _alt_urls(primary: str, md5: Optional[str]) -> list[str]:
+def _fallback_urls(primary: str, md5: Optional[str]) -> list[str]:
+    """
+    Build a list of fallback URLs to cycle through on failure.
+    Always includes library.lol and multiple CDN hosts.
+    """
     urls = [primary]
-    t    = md5 or md5_from_url(primary)
+    t = md5 or md5_from_url(primary)
     if t:
-        for h in DOWNLOAD_HOSTS:
-            c = f"{h}/main/{t}"
+        candidates = [
+            f"https://library.lol/main/{t}",
+            f"https://libgen.li/ads.php?md5={t}",
+        ]
+        for h in [
+            "https://cdn1.booksdl.org",
+            "https://cdn2.booksdl.org",
+            "https://cdn3.booksdl.org",
+        ]:
+            candidates.append(f"{h}/main/{t}")
+        for c in candidates:
             if c not in urls:
                 urls.append(c)
     return urls
 
 
-def download(url: str, out: Path, md5: Optional[str] = None) -> Path:
-    alts = _alt_urls(url, md5)
-    last: Optional[Exception] = None
+def run_download(raw_url: str, out_dir: Path, md5: Optional[str]) -> Path:
+    """
+    Resolve the URL then download with retries and fallback URL cycling.
+    """
+    dbg(f"Resolving: {raw_url[:80]}")
+    try:
+        dl_url, page_md5 = resolve_to_download_url(raw_url)
+    except Exception as e:
+        dbg(f"Resolution failed: {e}")
+        raise RuntimeError(f"Could not resolve download URL: {e}") from e
+
+    dbg(f"Resolved to: {dl_url[:80]}")
+
+    final_md5 = (
+        md5
+        or page_md5
+        or (raw_url.strip().lower() if is_md5(raw_url) else None)
+        or md5_from_url(raw_url)
+        or md5_from_url(dl_url)
+    )
+    if final_md5:
+        dbg(f"Will verify MD5: {final_md5}")
+
+    fallbacks = _fallback_urls(dl_url, final_md5)
+    last_err: Optional[Exception] = None
 
     for attempt in range(1, MAX_RETRIES + 1):
-        current = url if attempt <= 3 else alts[(attempt - 4) % len(alts)]
-        print(f"\n{'━' * 55}")
-        print(f"  Attempt {attempt}/{MAX_RETRIES}  —  {current[:80]}")
+        # Use primary for first 2 attempts, then cycle fallbacks
+        if attempt <= 2:
+            url = dl_url
+        else:
+            # Re-resolve on attempt 3 in case the link was stale
+            if attempt == 3 and final_md5:
+                try:
+                    dbg("Re-resolving URL (attempt 3)...")
+                    dl_url, _ = resolve_to_download_url(
+                        final_md5 if is_md5(raw_url) else raw_url
+                    )
+                    fallbacks = _fallback_urls(dl_url, final_md5)
+                    dbg(f"  Re-resolved: {dl_url[:80]}")
+                except Exception as e:
+                    dbg(f"  Re-resolve failed: {e}")
+            url = fallbacks[(attempt - 3) % len(fallbacks)]
+
+        print(f"\n{'━'*55}")
+        print(f"  Attempt {attempt}/{MAX_RETRIES}")
+        dbg(f"  URL: {url[:80]}")
 
         try:
-            return download_file(current, out, md5)
+            return download_file(url, out_dir, final_md5)
         except (
             requests.exceptions.ConnectionError,
             requests.exceptions.ChunkedEncodingError,
@@ -565,30 +677,30 @@ def download(url: str, out: Path, md5: Optional[str] = None) -> Path:
             TimeoutError,
             IOError,
         ) as e:
-            last = e
-            print(f"  ✗ {type(e).__name__}: {e}")
+            last_err = e
+            dbg(f"  ✗ {type(e).__name__}: {e}")
         except RuntimeError as e:
-            last = e
-            print(f"  ✗ {e}")
+            last_err = e
+            dbg(f"  ✗ RuntimeError: {e}")
+            # If it's an HTML/CAPTCHA error, try a different URL next
         except Exception as e:
-            last = e
-            print(f"  ✗ Unexpected {type(e).__name__}: {e}")
+            last_err = e
+            dbg(f"  ✗ {type(e).__name__}: {e}")
 
         if attempt < MAX_RETRIES:
-            wait = min(BASE_BACKOFF * 2 ** (attempt - 1), MAX_BACKOFF)
+            wait = min(BASE_BACKOFF * 2**(attempt-1), MAX_BACKOFF)
             wait *= random.uniform(0.8, 1.2)
-            print(f"  ⏳ {wait:.1f}s before retry...")
+            dbg(f"  Waiting {wait:.1f}s...")
             time.sleep(wait)
 
-    raise RuntimeError(f"All {MAX_RETRIES} attempts failed. Last: {last}")
+    raise RuntimeError(f"All {MAX_RETRIES} attempts failed. Last: {last_err}")
 
-
-# ─────────────────────────────────────────── main ─────────────────────────────
+# ──────────────────────────────────────────────────── main ────────────────────
 
 def main() -> int:
-    book_url = os.environ.get("BOOK_URL", "").strip()
-    raw_md5  = os.environ.get("EXPECTED_MD5", "").strip().lower()
-    out_dir  = Path(os.environ.get("OUTPUT_DIR", "downloads").strip())
+    book_url = os.environ.get("BOOK_URL","").strip()
+    raw_md5  = os.environ.get("EXPECTED_MD5","").strip().lower()
+    out_dir  = Path(os.environ.get("OUTPUT_DIR","downloads").strip())
 
     if not book_url:
         print("💥 BOOK_URL is required", file=sys.stderr)
@@ -596,61 +708,39 @@ def main() -> int:
 
     user_md5: Optional[str] = raw_md5 if is_md5(raw_md5) else None
 
-    # ── cache check ───────────────────────────────────────────────────────────
     cache = load_cache()
     if book_url in cache:
         p = Path(cache[book_url]["path"])
         if p.exists():
             print(f"✓ Already downloaded: {p}  ({fmt(p.stat().st_size)})")
             return 0
-        print("⚠ Cache stale — re-downloading")
+        dbg("Cache stale — re-downloading")
         del cache[book_url]
 
-    print("=" * 60)
+    print("="*60)
     print(f"📚 Input : {book_url}")
-    print(f"🔐 MD5   : {user_md5 or '(none supplied)'}")
+    print(f"🔐 MD5   : {user_md5 or '(none)'}")
     print(f"📁 OutDir: {out_dir.resolve()}")
-    print("=" * 60)
+    print("="*60)
 
-    # ── resolve ───────────────────────────────────────────────────────────────
     try:
-        dl_url, page_md5 = resolve(book_url)
-    except Exception as e:
-        print(f"💥 Resolution failed: {e}", file=sys.stderr)
-        return 1
-
-    print(f"  → {dl_url[:80]}")
-
-    # Final MD5 to verify against (user > page > url)
-    final_md5 = (
-        user_md5
-        or page_md5
-        or (book_url.lower() if is_md5(book_url) else None)
-        or md5_from_url(book_url)
-        or md5_from_url(dl_url)
-    )
-    if final_md5:
-        print(f"🔐 Will verify MD5: {final_md5}")
-
-    # ── download ──────────────────────────────────────────────────────────────
-    try:
-        path = download(dl_url, out_dir, final_md5)
+        path = run_download(book_url, out_dir, user_md5)
     except RuntimeError as e:
-        print(f"\n💥 {e}", file=sys.stderr)
+        print(f"\n💥 FAILED: {e}", file=sys.stderr)
         return 1
 
     size     = path.stat().st_size
-    checksum = md5_file(path)
+    checksum = file_md5(path)
 
-    print(f"\n{'=' * 60}")
-    print(f"✅ Done: {path}")
+    print(f"\n{'='*60}")
+    print(f"✅ {path}")
     print(f"   Size: {fmt(size)}")
     print(f"   MD5 : {checksum}")
-    print(f"{'=' * 60}")
+    print(f"{'='*60}")
 
     cache[book_url] = {
-        "path": str(path), "size": size, "md5": checksum,
-        "download_url": dl_url, "ts": time.time(),
+        "path": str(path), "size": size,
+        "md5": checksum, "ts": time.time(),
     }
     save_cache(cache)
     return 0
