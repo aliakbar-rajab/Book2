@@ -1,0 +1,100 @@
+name: Download Books
+
+on:
+  workflow_dispatch:
+    inputs:
+      book_url:
+        description: 'MD5 hash OR libgen.li/ads.php?md5=... OR library.lol/main/... URL'
+        required: true
+        type: string
+      expected_md5:
+        description: 'Expected MD5 hash (optional, for integrity check)'
+        required: false
+        type: string
+      output_dir:
+        description: 'Output directory (default: downloads)'
+        required: false
+        default: 'downloads'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-libgen
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip --quiet
+          pip install --quiet requests beautifulsoup4 lxml tqdm urllib3
+
+      - name: Restore download cache
+        uses: actions/cache@v4
+        with:
+          path: .download_cache
+          key: libgen-dl-${{ github.run_id }}
+          restore-keys: libgen-dl-
+
+      - name: Download book
+        id: download
+        env:
+          BOOK_URL: ${{ github.event.inputs.book_url }}
+          EXPECTED_MD5: ${{ github.event.inputs.expected_md5 }}
+          OUTPUT_DIR: ${{ github.event.inputs.output_dir }}
+        run: python scripts/download.py
+
+      - name: Save download cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .download_cache
+          key: libgen-dl-${{ github.run_id }}
+
+      - name: Upload as artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloaded-book-${{ github.run_id }}
+          path: ${{ github.event.inputs.output_dir }}/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+          SAFE_URL=$(echo "${{ github.event.inputs.book_url }}" | tr -dc '[:print:]' | cut -c1-80)
+          git commit -m "📚 Download: ${SAFE_URL}"
+          for i in 1 2 3 4 5; do
+            git fetch origin ${{ github.ref_name }} 2>/dev/null || true
+            git rebase origin/${{ github.ref_name }} 2>/dev/null || true
+            git push origin ${{ github.ref_name }} && echo "✓ Pushed" && exit 0
+            sleep $((i * 5))
+          done
+          echo "⚠ Push failed — book saved as artifact"
+          exit 0
