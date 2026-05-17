@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       book_url:
-        description: 'MD5 hash (best) or libgen ads.php URL or library.lol URL'
+        description: 'Direct file URL only. HTML pages, ads.php, edition.php, and CAPTCHA pages are not supported.'
         required: true
         type: string
       expected_md5:
-        description: 'Expected MD5 (optional)'
+        description: 'Expected MD5 hash, optional but recommended'
         required: false
         type: string
       output_dir:
@@ -20,82 +20,85 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: download-books-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 90
+
+    env:
+      BOOK_URL: ${{ inputs.book_url }}
+      EXPECTED_MD5: ${{ inputs.expected_md5 }}
+      OUTPUT_DIR: ${{ inputs.output_dir }}
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          # NO cache: 'pip' here — that's what caused the error
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-v1
-          restore-keys: pip-${{ runner.os }}-
-
-      - name: Install dependencies
+      - name: Download file
+        id: download
         run: |
-          python -m pip install --upgrade pip --quiet
-          pip install --quiet requests beautifulsoup4 lxml tqdm urllib3
+          python3 --version
+          python3 scripts/download.py
 
-      - name: Restore download cache
-        uses: actions/cache@v4
-        with:
-          path: .download_cache
-          key: libgen-dl-${{ github.run_id }}
-          restore-keys: libgen-dl-
-
-      - name: Download book
-        env:
-          BOOK_URL: ${{ github.event.inputs.book_url }}
-          EXPECTED_MD5: ${{ github.event.inputs.expected_md5 }}
-          OUTPUT_DIR: ${{ github.event.inputs.output_dir }}
-        run: python scripts/download.py
-
-      - name: Save download cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: .download_cache
-          key: libgen-dl-${{ github.run_id }}
-
-      - name: Upload artifact (backup)
-        if: always()
+      - name: Upload artifact backup
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: book-${{ github.run_id }}
-          path: ${{ github.event.inputs.output_dir }}/
+          name: downloaded-book-${{ github.run_id }}
+          path: ${{ env.OUTPUT_DIR }}/
           retention-days: 7
           if-no-files-found: warn
 
-      - name: Commit and push
+      - name: Commit and push downloaded file
+        if: success()
+        env:
+          COMMIT_INPUT: ${{ inputs.book_url }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "Nothing to commit"
+          if [ ! -d "$OUTPUT_DIR" ]; then
+            echo "No output directory found."
             exit 0
           fi
-          SAFE=$(echo "${{ github.event.inputs.book_url }}" | tr -dc '[:print:]' | cut -c1-80)
-          git commit -m "📚 ${SAFE}"
+
+          BIG_FILE="$(find "$OUTPUT_DIR" -type f -size +95M -print -quit)"
+          if [ -n "$BIG_FILE" ]; then
+            echo "::warning::File is larger than GitHub's normal git limit. It was uploaded as an artifact instead."
+            echo "Large file: $BIG_FILE"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -f -- "$OUTPUT_DIR"
+
+          if git diff --cached --quiet; then
+            echo "Nothing new to commit."
+            exit 0
+          fi
+
+          SAFE="$(printf '%s' "$COMMIT_INPUT" | tr -cd '[:print:]' | cut -c1-80)"
+          git commit -m "📚 Download: ${SAFE}"
+
+          BRANCH="${GITHUB_REF_NAME}"
+
           for i in 1 2 3 4 5; do
-            git fetch origin ${{ github.ref_name }} 2>/dev/null || true
-            git rebase origin/${{ github.ref_name }} 2>/dev/null || true
-            git push origin ${{ github.ref_name }} && echo "✓ pushed" && exit 0
+            echo "Push attempt $i/5..."
+            git pull --rebase --autostash origin "$BRANCH" || true
+
+            if git push origin "HEAD:$BRANCH"; then
+              echo "Pushed successfully."
+              exit 0
+            fi
+
             sleep $((i * 5))
           done
-          echo "⚠ push failed — file is in the artifact"
+
+          echo "::warning::Push failed. File was uploaded as artifact."
           exit 0
