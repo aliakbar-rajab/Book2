@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       book_url:
-        description: 'MD5 hash OR libgen.li/ads.php?md5=... OR library.lol/main/... URL'
+        description: 'MD5 hash (best) or libgen ads.php URL or library.lol URL'
         required: true
         type: string
       expected_md5:
-        description: 'Expected MD5 hash (optional, for integrity check)'
+        description: 'Expected MD5 (optional)'
         required: false
         type: string
       output_dir:
-        description: 'Output directory (default: downloads)'
+        description: 'Output directory'
         required: false
         default: 'downloads'
         type: string
@@ -26,7 +26,7 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
@@ -36,12 +36,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          # NO cache: 'pip' here — that's what caused the error
 
-      - name: Cache pip packages
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-libgen
+          key: pip-${{ runner.os }}-v1
           restore-keys: pip-${{ runner.os }}-
 
       - name: Install dependencies
@@ -57,7 +58,6 @@ jobs:
           restore-keys: libgen-dl-
 
       - name: Download book
-        id: download
         env:
           BOOK_URL: ${{ github.event.inputs.book_url }}
           EXPECTED_MD5: ${{ github.event.inputs.expected_md5 }}
@@ -71,10 +71,11 @@ jobs:
           path: .download_cache
           key: libgen-dl-${{ github.run_id }}
 
-      - name: Upload as artifact (backup)
+      - name: Upload artifact (backup)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: downloaded-book-${{ github.run_id }}
+          name: book-${{ github.run_id }}
           path: ${{ github.event.inputs.output_dir }}/
           retention-days: 7
           if-no-files-found: warn
@@ -88,13 +89,13 @@ jobs:
             echo "Nothing to commit"
             exit 0
           fi
-          SAFE_URL=$(echo "${{ github.event.inputs.book_url }}" | tr -dc '[:print:]' | cut -c1-80)
-          git commit -m "📚 Download: ${SAFE_URL}"
+          SAFE=$(echo "${{ github.event.inputs.book_url }}" | tr -dc '[:print:]' | cut -c1-80)
+          git commit -m "📚 ${SAFE}"
           for i in 1 2 3 4 5; do
             git fetch origin ${{ github.ref_name }} 2>/dev/null || true
             git rebase origin/${{ github.ref_name }} 2>/dev/null || true
-            git push origin ${{ github.ref_name }} && echo "✓ Pushed" && exit 0
+            git push origin ${{ github.ref_name }} && echo "✓ pushed" && exit 0
             sleep $((i * 5))
           done
-          echo "⚠ Push failed — book saved as artifact"
+          echo "⚠ push failed — file is in the artifact"
           exit 0
